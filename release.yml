@@ -1,0 +1,41 @@
+name: Release X-Panel
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build amd64
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o xui-release -v main.go
+          mkdir -p x-ui/bin
+          cp xui-release x-ui/x-ui
+          cp x-ui.service x-ui/x-ui.service
+          cp x-ui.sh x-ui/x-ui.sh
+          cd x-ui/bin
+          wget https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip Xray-linux-64.zip
+          rm -f Xray-linux-64.zip geoip.dat geosite.dat
+          mv xray xray-linux-amd64
+          chmod +x xray-linux-amd64
+          wget https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+          wget https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+          cd ../..
+          tar -zcvf x-ui-linux-amd64.tar.gz x-ui
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: x-ui-linux-amd64.tar.gz
