@@ -1,0 +1,201 @@
+name: Build X-Panel Binary
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  XRAY_VERSION: latest
+
+jobs:
+  # ==================== 构建作业 ====================
+  build:
+    name: Build ${{ matrix.tar_arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            xray_arch: 64
+            tar_arch: amd64
+          - goarch: arm64
+            xray_arch: arm64-v8a
+            tar_arch: arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Show Go version
+        run: go version
+
+      # ---------- 编译主程序 ----------
+      - name: Build x-ui binary
+        run: |
+          set -e
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags "-s -w" -o xui-release -v main.go
+          ls -lh xui-release
+
+      # ---------- 组装目录 ----------
+      - name: Prepare package directory
+        run: |
+          set -e
+          mkdir -p x-ui/bin
+          cp xui-release x-ui/x-ui
+          chmod +x x-ui/x-ui
+
+          # 复制 service 文件（如果存在）
+          if [ -f x-ui.service ]; then
+            cp x-ui.service x-ui/x-ui.service
+          else
+            cat > x-ui/x-ui.service <<'EOF'
+          [Unit]
+          Description=x-ui Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/usr/local/x-ui/
+          ExecStart=/usr/local/x-ui/x-ui
+          Restart=on-failure
+          RestartSec=3s
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          fi
+
+          # 复制管理脚本
+          if [ -f x-ui.sh ]; then
+            cp x-ui.sh x-ui/x-ui.sh
+            chmod +x x-ui/x-ui.sh
+          fi
+
+      # ---------- 下载 Xray 核心 ----------
+      - name: Download Xray core
+        run: |
+          set -e
+          cd x-ui/bin
+          URL="https://github.com/XTLS/Xray-core/releases/${XRAY_VERSION}/download/Xray-linux-${{ matrix.xray_arch }}.zip"
+          echo "Downloading: $URL"
+          wget -q "$URL" -O xray.zip
+          unzip -q xray.zip
+          rm -f xray.zip geoip.dat geosite.dat
+          mv xray xray-linux-${{ matrix.tar_arch }}
+          chmod +x xray-linux-${{ matrix.tar_arch }}
+          ls -lh
+
+      # ---------- 下载 geo 数据 ----------
+      - name: Download geoip / geosite
+        run: |
+          set -e
+          cd x-ui/bin
+          wget -q https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+          wget -q https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+          ls -lh
+
+      # ---------- 生成 VERSION 文件 ----------
+      - name: Generate VERSION file
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "${GITHUB_REF_NAME}" > VERSION
+          else
+            echo "v$(date +%Y.%m.%d)-${GITHUB_SHA::7}" > VERSION
+          fi
+          echo "VERSION = $(cat VERSION)"
+
+      # ---------- 打包 ----------
+      - name: Create tarball
+        run: |
+          set -e
+          tar -zcvf x-ui-linux-${{ matrix.tar_arch }}.tar.gz x-ui
+          ls -lh x-ui-linux-${{ matrix.tar_arch }}.tar.gz
+
+      # ---------- 上传 Artifact ----------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x-ui-linux-${{ matrix.tar_arch }}
+          path: |
+            x-ui-linux-${{ matrix.tar_arch }}.tar.gz
+            VERSION
+          retention-days: 30
+
+  # ==================== 发布 Release（仅 tag 触发）====================
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+  # ==================== 更新二进制分支（可选）====================
+  # 启用后，每次 tag 推送或 main 分支推送，都会把最新二进制同步到
+  # 独立的 `binary` 分支，便于 install.sh 通过 raw 直接拉取。
+  # 如不需要，可以整个 job 删除。
+  update-binary-branch:
+    name: Update binary branch
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Push binaries to `binary` branch
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 创建孤儿分支
+          git checkout --orphan binary-tmp
+          git rm -rf . >/dev/null 2>&1 || true
+
+          # 拷入所有二进制和辅助文件
+          cp artifacts/*.tar.gz ./
+          cp artifacts/VERSION ./VERSION
+          cp x-ui.sh ./x-ui.sh 2>/dev/null || true
+          cp install.sh ./install.sh 2>/dev/null || true
+
+          git add -f *.tar.gz VERSION x-ui.sh install.sh 2>/dev/null || true
+          git commit -m "[skip ci] Update binaries $(date +%Y%m%d-%H%M%S)"
+
+          # 强制推到 binary 分支
+          git push -f origin binary-tmp:binary
